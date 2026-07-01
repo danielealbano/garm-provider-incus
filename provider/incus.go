@@ -17,7 +17,9 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -255,7 +257,7 @@ func (l *Incus) getCreateInstanceArgs(ctx context.Context, bootstrapParams commo
 	return args, nil
 }
 
-func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost) error {
+func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost, hc hookContext) error {
 	cli, err := l.getCLI(ctx)
 	if err != nil {
 		return errors.Wrap(err, "fetching client")
@@ -272,6 +274,15 @@ func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost
 		return errors.Wrap(err, "waiting for instance creation")
 	}
 
+	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPostCreate, "vm_post_create", hookPhaseCreate, hc); err != nil {
+		l.cleanupFailedInstance(ctx, createArgs.Name)
+		return errors.Wrap(err, "vm_post_create hook")
+	}
+	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPreStart, "vm_pre_start", hookPhaseStart, hc); err != nil {
+		l.cleanupFailedInstance(ctx, createArgs.Name)
+		return errors.Wrap(err, "vm_pre_start hook")
+	}
+
 	// Get Incus to start the instance (background operation)
 	reqState := api.InstanceStatePut{
 		Action:  "start",
@@ -280,15 +291,57 @@ func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost
 
 	op, err = cli.UpdateInstanceState(createArgs.Name, reqState, "")
 	if err != nil {
+		l.cleanupFailedInstance(ctx, createArgs.Name)
 		return errors.Wrap(err, "starting instance")
 	}
 
 	// Wait for the operation to complete
 	err = op.Wait()
 	if err != nil {
+		l.cleanupFailedInstance(ctx, createArgs.Name)
 		return errors.Wrap(err, "waiting for instance to start")
 	}
 	return nil
+}
+
+func hookContextFromBootstrap(bootstrapParams commonParams.BootstrapInstance, controllerID string, instanceType config.IncusImageType) hookContext {
+	return hookContext{
+		Name:         bootstrapParams.Name,
+		ControllerID: controllerID,
+		PoolID:       bootstrapParams.PoolID,
+		OSType:       string(bootstrapParams.OSType),
+		OSArch:       string(bootstrapParams.OSArch),
+		InstanceType: string(instanceType),
+	}
+}
+
+// hookContextForInstance builds a best-effort context (delete time; name only).
+func (l *Incus) hookContextForInstance(ctx context.Context, name string) hookContext {
+	hc := hookContext{Name: name, ControllerID: l.controllerID, InstanceType: string(l.cfg.GetInstanceType())}
+	cli, err := l.getCLI(ctx)
+	if err != nil {
+		return hc
+	}
+	full, _, err := cli.GetInstanceFull(name)
+	if err != nil {
+		return hc
+	}
+	hc.PoolID = full.ExpandedConfig[poolIDKey]
+	hc.OSArch = string(incusToConfigArch[full.Architecture])
+	incusOS := full.ExpandedConfig["image.os"]
+	osType, _ := util.OSToOSType(incusOS)
+	if osType == "" {
+		osType = commonParams.OSType(full.ExpandedConfig[osTypeKeyName])
+	}
+	hc.OSType = string(osType)
+	return hc
+}
+
+// cleanupFailedInstance removes an instance without running delete hooks.
+func (l *Incus) cleanupFailedInstance(ctx context.Context, name string) {
+	if err := l.deleteInstanceRaw(ctx, name); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to clean up instance %s after hook failure: %v\n", name, err)
+	}
 }
 
 // CreateInstance creates a new compute instance in the provider.
@@ -302,13 +355,42 @@ func (l *Incus) CreateInstance(ctx context.Context, bootstrapParams commonParams
 		return commonParams.ProviderInstance{}, errors.Wrap(err, "fetching create args")
 	}
 
-	if err := l.launchInstance(ctx, args); err != nil {
+	hc := hookContextFromBootstrap(bootstrapParams, l.controllerID, l.cfg.GetInstanceType())
+
+	if hook := l.cfg.Hooks.VMPreCreate; hook != nil {
+		payload, err := json.Marshal(args)
+		if err != nil {
+			return commonParams.ProviderInstance{}, errors.Wrap(err, "marshaling create args for vm_pre_create hook")
+		}
+		out, err := runHook(ctx, hook, "vm_pre_create", hookPhaseCreate, hc, payload)
+		if err != nil {
+			if !hook.IgnoreFailure {
+				return commonParams.ProviderInstance{}, errors.Wrap(err, "vm_pre_create hook")
+			}
+			fmt.Fprintf(os.Stderr, "ignoring vm_pre_create hook failure: %v\n", err)
+		} else if len(out) > 0 {
+			var mutated api.InstancesPost
+			if err := json.Unmarshal(out, &mutated); err != nil {
+				return commonParams.ProviderInstance{}, errors.Wrap(err, "unmarshaling vm_pre_create hook output")
+			}
+			args = mutated
+		}
+	}
+
+	if err := l.launchInstance(ctx, args, hc); err != nil {
 		return commonParams.ProviderInstance{}, errors.Wrap(err, "creating instance")
 	}
 
 	ret, err := l.waitInstanceHasIP(ctx, args.Name)
 	if err != nil {
-		return commonParams.ProviderInstance{}, errors.Wrap(err, "fetching instance")
+		l.cleanupFailedInstance(ctx, args.Name)
+		return commonParams.ProviderInstance{}, errors.Wrap(err, "waiting for instance IP")
+	}
+
+	// vm_post_start: instance has an IPv4, i.e. the incus-agent is reachable.
+	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPostStart, "vm_post_start", hookPhaseStart, hc); err != nil {
+		l.cleanupFailedInstance(ctx, args.Name)
+		return commonParams.ProviderInstance{}, errors.Wrap(err, "vm_post_start hook")
 	}
 
 	return ret, nil
@@ -331,8 +413,30 @@ func (l *Incus) GetInstance(ctx context.Context, instanceName string) (commonPar
 	return incusInstanceToAPIInstance(instance), nil
 }
 
-// Delete instance will delete the instance in a provider.
+// DeleteInstance deletes the instance, running vm_pre_delete/vm_post_delete
+// around it. With no delete hook it is identical to deleteInstanceRaw.
 func (l *Incus) DeleteInstance(ctx context.Context, instance string) error {
+	hooks := l.cfg.Hooks
+	if hooks.VMPreDelete == nil && hooks.VMPostDelete == nil {
+		return l.deleteInstanceRaw(ctx, instance)
+	}
+
+	hc := l.hookContextForInstance(ctx, instance)
+
+	if err := runSideEffectHook(ctx, hooks.VMPreDelete, "vm_pre_delete", hookPhaseDelete, hc); err != nil {
+		fmt.Fprintf(os.Stderr, "vm_pre_delete hook failed for %s; continuing: %v\n", instance, err)
+	}
+	if err := l.deleteInstanceRaw(ctx, instance); err != nil {
+		return err
+	}
+	if err := runSideEffectHook(ctx, hooks.VMPostDelete, "vm_post_delete", hookPhaseDelete, hc); err != nil {
+		fmt.Fprintf(os.Stderr, "vm_post_delete hook failed for %s: %v\n", instance, err)
+	}
+	return nil
+}
+
+// deleteInstanceRaw stops and removes the instance without running hooks.
+func (l *Incus) deleteInstanceRaw(ctx context.Context, instance string) error {
 	cli, err := l.getCLI(ctx)
 	if err != nil {
 		return errors.Wrap(err, "fetching client")
