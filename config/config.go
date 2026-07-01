@@ -80,6 +80,65 @@ func NewConfig(cfgFile string) (*Incus, error) {
 	return &config, nil
 }
 
+// DefaultHookTimeout is the default and maximum per-hook execution time, in
+// seconds.
+const DefaultHookTimeout = 60
+
+// Hook defines an external command executed at an instance lifecycle point.
+// Command is executed directly (not via a shell); it must be an executable file
+// (e.g. a shell script with a shebang, marked +x).
+type Hook struct {
+	Command       string   `toml:"command" json:"command"`
+	Args          []string `toml:"args" json:"args"`
+	Timeout       int      `toml:"timeout" json:"timeout"`
+	IgnoreFailure bool     `toml:"ignore_failure" json:"ignore_failure"`
+}
+
+// Hooks groups the supported instance lifecycle hooks.
+type Hooks struct {
+	VMPreCreate  *Hook `toml:"vm_pre_create" json:"vm_pre_create"`
+	VMPostCreate *Hook `toml:"vm_post_create" json:"vm_post_create"`
+	VMPreStart   *Hook `toml:"vm_pre_start" json:"vm_pre_start"`
+	VMPostStart  *Hook `toml:"vm_post_start" json:"vm_post_start"`
+	VMPreDelete  *Hook `toml:"vm_pre_delete" json:"vm_pre_delete"`
+	VMPostDelete *Hook `toml:"vm_post_delete" json:"vm_post_delete"`
+}
+
+// Validate checks the hook command is a usable executable and normalizes the
+// timeout to the (0, DefaultHookTimeout] range.
+func (h *Hook) Validate() error {
+	if h == nil {
+		return nil
+	}
+	if h.Command == "" {
+		return fmt.Errorf("hook command is empty")
+	}
+	info, err := os.Stat(h.Command)
+	if err != nil {
+		return fmt.Errorf("hook command %q: %w", h.Command, err)
+	}
+	if info.IsDir() || info.Mode()&0o111 == 0 {
+		return fmt.Errorf("hook command %q is not an executable file", h.Command)
+	}
+	if h.Timeout <= 0 || h.Timeout > DefaultHookTimeout {
+		h.Timeout = DefaultHookTimeout
+	}
+	return nil
+}
+
+// Validate validates every configured hook.
+func (h *Hooks) Validate() error {
+	for _, hook := range []*Hook{
+		h.VMPreCreate, h.VMPostCreate, h.VMPreStart,
+		h.VMPostStart, h.VMPreDelete, h.VMPostDelete,
+	} {
+		if err := hook.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Incus holds connection information for an Incus cluster.
 type Incus struct {
 	// UnixSocket is the path on disk to the Incus unix socket. If defined,
@@ -118,6 +177,9 @@ type Incus struct {
 
 	// InstanceType allows you to choose between a virtual machine and a container
 	InstanceType IncusImageType `toml:"instance_type" json:"instance-type"`
+
+	// Hooks holds optional external commands run at instance lifecycle points.
+	Hooks Hooks `toml:"hooks" json:"hooks"`
 }
 
 func (l *Incus) GetInstanceType() IncusImageType {
@@ -130,6 +192,10 @@ func (l *Incus) GetInstanceType() IncusImageType {
 }
 
 func (l *Incus) Validate() error {
+	if err := l.Hooks.Validate(); err != nil {
+		return fmt.Errorf("validating hooks: %w", err)
+	}
+
 	if l.UnixSocket != "" {
 		if _, err := os.Stat(l.UnixSocket); err != nil {
 			return fmt.Errorf("could not access unix socket %s: %w", l.UnixSocket, err)
