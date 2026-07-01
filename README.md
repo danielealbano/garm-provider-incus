@@ -138,3 +138,67 @@ You can also set a spec when creating a new pool, using the same flag.
 Workers in that pool will be created taking into account the specs you set on the pool.
 
 Aside from the above schema, this provider also supports the generic schema implemented by [`garm-provider-common`](https://github.com/cloudbase/garm-provider-common/tree/main#userdata)
+
+## Lifecycle hooks
+
+The provider can run external commands at instance lifecycle points. Hooks are
+configured in the provider config file, one optional block per hook:
+
+```toml
+[hooks.vm_pre_create]
+    command = "/opt/garm/hooks/vm-pre-create.sh"
+    args = ["--role", "builder"]
+    timeout = 60
+    ignore_failure = false
+
+[hooks.vm_post_create]
+    command = "/opt/garm/hooks/vm-post-create.sh"
+[hooks.vm_pre_start]
+    command = "/opt/garm/hooks/vm-pre-start.sh"
+[hooks.vm_post_start]
+    command = "/opt/garm/hooks/vm-post-start.sh"
+[hooks.vm_pre_delete]
+    command = "/opt/garm/hooks/vm-pre-delete.sh"
+[hooks.vm_post_delete]
+    command = "/opt/garm/hooks/vm-post-delete.sh"
+```
+
+The six hooks fire at:
+
+| Hook | When |
+| --- | --- |
+| `vm_pre_create` | before the instance is created |
+| `vm_post_create` | after create, before start (instance stopped) |
+| `vm_pre_start` | before start |
+| `vm_post_start` | after the instance has an IPv4 (incus-agent reachable) |
+| `vm_pre_delete` | before the instance is stopped/removed |
+| `vm_post_delete` | after the instance is removed |
+
+Per-hook options: `command` (path to an executable — a shell script needs a
+shebang and the `+x` bit; it is run directly, **not** via a shell), `args`
+(passed verbatim), `timeout` (seconds; default and maximum `60`),
+`ignore_failure` (default `false`).
+
+Every hook receives context via environment: `GARM_HOOK`, `GARM_HOOK_PHASE`,
+`GARM_INSTANCE_NAME`, `GARM_POOL_ID`, `GARM_CONTROLLER_ID`, `GARM_OS_TYPE`,
+`GARM_OS_ARCH`, `GARM_INSTANCE_TYPE`, `GARM_HOOK_IGNORE_FAILURE`.
+
+`vm_pre_create` receives the incus `InstancesPost` JSON on **stdin** and must
+echo the (possibly modified) `InstancesPost` JSON on **stdout**; the provider
+applies it. It MUST NOT change instance-identity fields (`name` and the
+`user.runner-controller-id` / `user.runner-pool-id` / `user.os-type` /
+`user.os-arch` config keys) — those are used by garm and by later hooks. All
+other hooks receive an instance-context JSON on stdin and their stdout is
+ignored.
+
+Failure handling: if a create/start hook fails and `ignore_failure` is false,
+the instance is destroyed and the create returns an error; with `ignore_failure`
+true the failure is logged and creation continues. Delete-hook failures never
+block deletion (they are logged). Delete hooks also fire during
+`RemoveAllInstances` (once per instance) and may fire for an already-gone
+instance (garm retries failed creates), so they MUST be idempotent.
+
+Security: `vm_pre_create` stdin includes the full `InstancesPost`, which contains
+`user.user-data` (the runner registration token and other bootstrap secrets);
+and every hook inherits the provider process environment. Only configure trusted
+hook executables. See [`examples/hooks`](examples/hooks) for sample scripts.
