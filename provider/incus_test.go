@@ -17,6 +17,8 @@ package provider
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	commonParams "github.com/cloudbase/garm-provider-common/params"
@@ -378,7 +380,7 @@ func TestLaunchInstance(t *testing.T) {
 		Timeout: -1,
 	}, "").Return(mockOp, nil)
 
-	err := l.launchInstance(ctx, createArgs)
+	err := l.launchInstance(ctx, createArgs, hookContext{})
 	require.NoError(t, err)
 }
 
@@ -772,4 +774,227 @@ func TestStart(t *testing.T) {
 	}, "").Return(mockOp, nil)
 	err := l.Start(ctx, instanceName)
 	require.NoError(t, err)
+}
+
+// --- lifecycle hooks --------------------------------------------------------
+
+func newHookProvider(cli InstanceServerInterface, hooks config.Hooks) *Incus {
+	return &Incus{
+		cfg: &config.Incus{
+			UnixSocket:            "/var/run/incus.sock",
+			InstanceType:          "virtual-machine",
+			IncludeDefaultProfile: true,
+			Hooks:                 hooks,
+		},
+		cli:          cli,
+		imageManager: &image{remotes: map[string]config.IncusImageRemote{"remote1": {Address: "remote1"}}},
+		controllerID: "controller",
+	}
+}
+
+func hookBootstrap() commonParams.BootstrapInstance {
+	return commonParams.BootstrapInstance{
+		Name:   "test-instance",
+		Tools:  []commonParams.RunnerApplicationDownload{{OS: ptr("linux"), Architecture: ptr("x86_64"), DownloadURL: ptr("https://example.com"), Filename: ptr("test-app")}},
+		Image:  "linux",
+		Flavor: "virtual-machine",
+		PoolID: "default",
+		OSArch: commonParams.Amd64,
+		OSType: commonParams.Linux,
+	}
+}
+
+// setupCreateFlow stubs the calls getCreateInstanceArgs+launchInstance make and
+// returns a shared operation. CreateInstance/UpdateInstanceState are left to the
+// caller so per-test capture/matchers are possible.
+func setupCreateFlow(cli *MockIncusServer) *MockOperation {
+	DefaultToolFetch = func(_ commonParams.OSType, _ commonParams.OSArch, tools []commonParams.RunnerApplicationDownload) (commonParams.RunnerApplicationDownload, error) {
+		return tools[0], nil
+	}
+	DefaultGetCloudconfig = func(_ commonParams.BootstrapInstance, _ commonParams.RunnerApplicationDownload, _ string) (string, error) {
+		return "#cloud-config", nil
+	}
+	aliases := map[string]*api.ImageAliasesEntry{"x86_64": {Name: "linux", Type: "virtual-machine"}}
+	cli.On("GetImageAliasArchitectures", config.IncusImageType("virtual-machine").String(), "linux").Return(aliases, nil)
+	cli.On("GetImage", aliases["x86_64"].Target).Return(&api.Image{Fingerprint: "123abc"}, "", nil)
+	cli.On("GetProfileNames").Return([]string{"default", "virtual-machine"}, nil)
+	op := new(MockOperation)
+	op.On("Wait").Return(nil)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	return op
+}
+
+func mockInstanceWithIP(cli *MockIncusServer) {
+	cli.On("GetInstanceFull", "test-instance").Return(&api.InstanceFull{
+		Instance: api.Instance{
+			InstancePut:    api.InstancePut{Architecture: "x86_64"},
+			Name:           "test-instance",
+			ExpandedConfig: map[string]string{"image.os": "ubuntu", poolIDKey: "default", osTypeKeyName: "linux"},
+			Type:           "virtual-machine",
+		},
+		State: &api.InstanceState{
+			Status:  "Running",
+			Network: map[string]api.InstanceStateNetwork{"eth0": {Addresses: []api.InstanceStateNetworkAddress{{Address: "10.10.0.0", Scope: "global"}}}},
+		},
+	}, "", nil)
+}
+
+// markerHook returns a hook whose script appends $GARM_HOOK to the marker file
+// (passed as arg $1) and writes nothing to stdout.
+func markerHook(t *testing.T, marker string) *config.Hook {
+	return &config.Hook{Command: writeExecScript(t, `printf '%s ' "$GARM_HOOK" >> "$1"`), Args: []string{marker}}
+}
+
+func TestCreateInstanceRunsHooksInOrder(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "order")
+	l := newHookProvider(cli, config.Hooks{
+		VMPreCreate:  markerHook(t, marker),
+		VMPostCreate: markerHook(t, marker),
+		VMPreStart:   markerHook(t, marker),
+		VMPostStart:  markerHook(t, marker),
+	})
+	op := setupCreateFlow(cli)
+	cli.On("CreateInstance", mock.Anything).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrap())
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "vm_pre_create vm_post_create vm_pre_start vm_post_start ", string(got))
+}
+
+func TestCreateInstancePreCreateMutation(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "out.json")
+	require.NoError(t, os.WriteFile(jsonPath, []byte(`{"name":"test-instance","architecture":"x86_64","description":"mutated-by-hook","type":"virtual-machine","source":{"type":"image","fingerprint":"123abc"},"profiles":["default","virtual-machine"],"config":{"user.runner-pool-id":"default"}}`), 0o644))
+	script := filepath.Join(dir, "hook.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null; cat \"$1\"\n"), 0o755))
+
+	l := newHookProvider(cli, config.Hooks{VMPreCreate: &config.Hook{Command: script, Args: []string{jsonPath}}})
+	op := setupCreateFlow(cli)
+	var got api.InstancesPost
+	cli.On("CreateInstance", mock.Anything).Run(func(a mock.Arguments) { got = a.Get(0).(api.InstancesPost) }).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrap())
+	require.NoError(t, err)
+	require.Equal(t, "mutated-by-hook", got.Description)
+}
+
+func TestCreateInstanceHookFailureCleansUp(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	l := newHookProvider(cli, config.Hooks{
+		VMPostCreate: &config.Hook{Command: writeExecScript(t, "exit 1")},
+	})
+	op := setupCreateFlow(cli)
+	cli.On("CreateInstance", mock.Anything).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	_, err := l.CreateInstance(ctx, hookBootstrap())
+	require.Error(t, err)
+	cli.AssertCalled(t, "DeleteInstance", "test-instance")
+}
+
+func TestCreateInstanceHookIgnoreFailure(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	l := newHookProvider(cli, config.Hooks{
+		VMPostCreate: &config.Hook{Command: writeExecScript(t, "exit 1"), IgnoreFailure: true},
+	})
+	op := setupCreateFlow(cli)
+	cli.On("CreateInstance", mock.Anything).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrap())
+	require.NoError(t, err)
+	cli.AssertNotCalled(t, "DeleteInstance", "test-instance")
+}
+
+func TestDeleteInstanceRunsDeleteHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	l := newHookProvider(cli, config.Hooks{
+		VMPreDelete:  markerHook(t, marker),
+		VMPostDelete: markerHook(t, marker),
+	})
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	mockInstanceWithIP(cli)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "vm_pre_delete vm_post_delete ", string(got))
+}
+
+func TestDeleteInstanceDeleteHookFailureNonBlocking(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	l := newHookProvider(cli, config.Hooks{
+		VMPreDelete: &config.Hook{Command: writeExecScript(t, "exit 1")},
+	})
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	mockInstanceWithIP(cli)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	cli.AssertCalled(t, "DeleteInstance", "test-instance")
+}
+
+func TestDeleteInstanceNoHooksRawPath(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	l := newHookProvider(cli, config.Hooks{})
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	cli.AssertNotCalled(t, "GetInstanceFull", "test-instance")
+	cli.AssertCalled(t, "DeleteInstance", "test-instance")
+}
+
+func TestRemoveAllInstancesRunsDeleteHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(t, marker)})
+	cli.On("GetInstancesFull", api.InstanceTypeAny).Return([]api.InstanceFull{
+		{
+			Instance: api.Instance{
+				InstancePut:    api.InstancePut{Architecture: "x86_64"},
+				Name:           "test-instance",
+				ExpandedConfig: map[string]string{"image.os": "ubuntu", poolIDKey: "default", controllerIDKeyName: "controller"},
+				Type:           "virtual-machine",
+			},
+			State: &api.InstanceState{Status: "Running"},
+		},
+	}, nil)
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	mockInstanceWithIP(cli)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.RemoveAllInstances(ctx))
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "vm_pre_delete ", string(got))
 }
