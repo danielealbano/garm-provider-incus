@@ -373,6 +373,9 @@ func (l *Incus) CreateInstance(ctx context.Context, bootstrapParams commonParams
 			if err := json.Unmarshal(out, &mutated); err != nil {
 				return commonParams.ProviderInstance{}, errors.Wrap(err, "unmarshaling vm_pre_create hook output")
 			}
+			if mutated.Name != args.Name {
+				return commonParams.ProviderInstance{}, fmt.Errorf("vm_pre_create hook must not change the instance name (%q -> %q)", args.Name, mutated.Name)
+			}
 			args = mutated
 		}
 	}

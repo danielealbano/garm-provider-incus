@@ -85,13 +85,11 @@ func NewConfig(cfgFile string) (*Incus, error) {
 const DefaultHookTimeout = 60
 
 // Hook defines an external command executed at an instance lifecycle point.
-// Command is executed directly (not via a shell); it must be an executable file
-// (e.g. a shell script with a shebang, marked +x).
+// Command is a shell command line run via "/bin/sh -c".
 type Hook struct {
-	Command       string   `toml:"command" json:"command"`
-	Args          []string `toml:"args" json:"args"`
-	Timeout       int      `toml:"timeout" json:"timeout"`
-	IgnoreFailure bool     `toml:"ignore_failure" json:"ignore_failure"`
+	Command       string `toml:"command" json:"command"`
+	Timeout       int    `toml:"timeout" json:"timeout"`
+	IgnoreFailure bool   `toml:"ignore_failure" json:"ignore_failure"`
 }
 
 // Hooks groups the supported instance lifecycle hooks.
@@ -104,21 +102,14 @@ type Hooks struct {
 	VMPostDelete *Hook `toml:"vm_post_delete" json:"vm_post_delete"`
 }
 
-// Validate checks the hook command is a usable executable and normalizes the
-// timeout to the (0, DefaultHookTimeout] range.
+// Validate checks the hook has a command and normalizes the timeout to the
+// (0, DefaultHookTimeout] range.
 func (h *Hook) Validate() error {
 	if h == nil {
 		return nil
 	}
 	if h.Command == "" {
 		return fmt.Errorf("hook command is empty")
-	}
-	info, err := os.Stat(h.Command)
-	if err != nil {
-		return fmt.Errorf("hook command %q: %w", h.Command, err)
-	}
-	if info.IsDir() || info.Mode()&0o111 == 0 {
-		return fmt.Errorf("hook command %q is not an executable file", h.Command)
 	}
 	if h.Timeout <= 0 || h.Timeout > DefaultHookTimeout {
 		h.Timeout = DefaultHookTimeout

@@ -16,9 +16,7 @@
 package config
 
 import (
-	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -179,46 +177,29 @@ func TestInvalidIncusImageRemotes(t *testing.T) {
 	require.EqualError(t, err, "remote default is invalid: invalid remote protocol bogus. Supported protocols: simplestreams")
 }
 
-func writeExecFile(t *testing.T, mode os.FileMode) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "hook.sh")
-	require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\n"), mode))
-	return p
-}
-
 func TestHookValidateEmptyCommand(t *testing.T) {
 	require.EqualError(t, (&Hook{}).Validate(), "hook command is empty")
 }
 
-func TestHookValidateNonExecutable(t *testing.T) {
-	require.ErrorContains(t, (&Hook{Command: writeExecFile(t, 0o644)}).Validate(), "not an executable file")
-	require.ErrorContains(t, (&Hook{Command: t.TempDir()}).Validate(), "not an executable file")
-	require.Error(t, (&Hook{Command: "/does/not/exist"}).Validate())
-}
-
 func TestHookValidateTimeoutNormalize(t *testing.T) {
-	cmd := writeExecFile(t, 0o755)
 	for in, want := range map[int]int{0: DefaultHookTimeout, -5: DefaultHookTimeout, 600: DefaultHookTimeout, 30: 30} {
-		h := &Hook{Command: cmd, Timeout: in}
+		h := &Hook{Command: "true", Timeout: in}
 		require.NoError(t, h.Validate())
 		require.Equal(t, want, h.Timeout, "timeout=%d", in)
 	}
 }
 
 func TestConfigParsesHooks(t *testing.T) {
-	cmd := writeExecFile(t, 0o755)
 	var cfg Incus
-	_, err := toml.Decode(fmt.Sprintf(`
+	_, err := toml.Decode(`
 url = "https://example.com:8443"
 [hooks.vm_pre_create]
-command = %q
-args = ["--role", "builder"]
+command = "/opt/garm/hooks/vm-pre-create.sh --role builder"
 timeout = 30
-`, cmd), &cfg)
+`, &cfg)
 	require.NoError(t, err)
 	require.NotNil(t, cfg.Hooks.VMPreCreate)
-	require.Equal(t, cmd, cfg.Hooks.VMPreCreate.Command)
-	require.Equal(t, []string{"--role", "builder"}, cfg.Hooks.VMPreCreate.Args)
+	require.Equal(t, "/opt/garm/hooks/vm-pre-create.sh --role builder", cfg.Hooks.VMPreCreate.Command)
 	require.Equal(t, 30, cfg.Hooks.VMPreCreate.Timeout)
 	require.NoError(t, cfg.Hooks.Validate())
 }

@@ -17,6 +17,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -839,10 +840,10 @@ func mockInstanceWithIP(cli *MockIncusServer) {
 	}, "", nil)
 }
 
-// markerHook returns a hook whose script appends $GARM_HOOK to the marker file
-// (passed as arg $1) and writes nothing to stdout.
-func markerHook(t *testing.T, marker string) *config.Hook {
-	return &config.Hook{Command: writeExecScript(t, `printf '%s ' "$GARM_HOOK" >> "$1"`), Args: []string{marker}}
+// markerHook returns a hook that appends $GARM_HOOK to the marker file and
+// writes nothing to stdout.
+func markerHook(marker string) *config.Hook {
+	return &config.Hook{Command: fmt.Sprintf(`printf '%%s ' "$GARM_HOOK" >> %q`, marker)}
 }
 
 func TestCreateInstanceRunsHooksInOrder(t *testing.T) {
@@ -850,10 +851,10 @@ func TestCreateInstanceRunsHooksInOrder(t *testing.T) {
 	cli := new(MockIncusServer)
 	marker := filepath.Join(t.TempDir(), "order")
 	l := newHookProvider(cli, config.Hooks{
-		VMPreCreate:  markerHook(t, marker),
-		VMPostCreate: markerHook(t, marker),
-		VMPreStart:   markerHook(t, marker),
-		VMPostStart:  markerHook(t, marker),
+		VMPreCreate:  markerHook(marker),
+		VMPostCreate: markerHook(marker),
+		VMPreStart:   markerHook(marker),
+		VMPostStart:  markerHook(marker),
 	})
 	op := setupCreateFlow(cli)
 	cli.On("CreateInstance", mock.Anything).Return(op, nil)
@@ -871,13 +872,10 @@ func TestCreateInstanceRunsHooksInOrder(t *testing.T) {
 func TestCreateInstancePreCreateMutation(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
-	dir := t.TempDir()
-	jsonPath := filepath.Join(dir, "out.json")
+	jsonPath := filepath.Join(t.TempDir(), "out.json")
 	require.NoError(t, os.WriteFile(jsonPath, []byte(`{"name":"test-instance","architecture":"x86_64","description":"mutated-by-hook","type":"virtual-machine","source":{"type":"image","fingerprint":"123abc"},"profiles":["default","virtual-machine"],"config":{"user.runner-pool-id":"default"}}`), 0o644))
-	script := filepath.Join(dir, "hook.sh")
-	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\ncat >/dev/null; cat \"$1\"\n"), 0o755))
 
-	l := newHookProvider(cli, config.Hooks{VMPreCreate: &config.Hook{Command: script, Args: []string{jsonPath}}})
+	l := newHookProvider(cli, config.Hooks{VMPreCreate: &config.Hook{Command: fmt.Sprintf("cat >/dev/null; cat %q", jsonPath)}})
 	op := setupCreateFlow(cli)
 	var got api.InstancesPost
 	cli.On("CreateInstance", mock.Anything).Run(func(a mock.Arguments) { got = a.Get(0).(api.InstancesPost) }).Return(op, nil)
@@ -889,11 +887,25 @@ func TestCreateInstancePreCreateMutation(t *testing.T) {
 	require.Equal(t, "mutated-by-hook", got.Description)
 }
 
+func TestCreateInstancePreCreateNameChangeRejected(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	jsonPath := filepath.Join(t.TempDir(), "out.json")
+	require.NoError(t, os.WriteFile(jsonPath, []byte(`{"name":"renamed","architecture":"x86_64","type":"virtual-machine","source":{"type":"image","fingerprint":"123abc"},"profiles":["default","virtual-machine"]}`), 0o644))
+	l := newHookProvider(cli, config.Hooks{VMPreCreate: &config.Hook{Command: fmt.Sprintf("cat >/dev/null; cat %q", jsonPath)}})
+	setupCreateFlow(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrap())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must not change the instance name")
+	cli.AssertNotCalled(t, "CreateInstance", mock.Anything)
+}
+
 func TestCreateInstanceHookFailureCleansUp(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
 	l := newHookProvider(cli, config.Hooks{
-		VMPostCreate: &config.Hook{Command: writeExecScript(t, "exit 1")},
+		VMPostCreate: &config.Hook{Command: "exit 1"},
 	})
 	op := setupCreateFlow(cli)
 	cli.On("CreateInstance", mock.Anything).Return(op, nil)
@@ -909,7 +921,7 @@ func TestCreateInstanceHookIgnoreFailure(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
 	l := newHookProvider(cli, config.Hooks{
-		VMPostCreate: &config.Hook{Command: writeExecScript(t, "exit 1"), IgnoreFailure: true},
+		VMPostCreate: &config.Hook{Command: "exit 1", IgnoreFailure: true},
 	})
 	op := setupCreateFlow(cli)
 	cli.On("CreateInstance", mock.Anything).Return(op, nil)
@@ -926,8 +938,8 @@ func TestDeleteInstanceRunsDeleteHooks(t *testing.T) {
 	cli := new(MockIncusServer)
 	marker := filepath.Join(t.TempDir(), "del")
 	l := newHookProvider(cli, config.Hooks{
-		VMPreDelete:  markerHook(t, marker),
-		VMPostDelete: markerHook(t, marker),
+		VMPreDelete:  markerHook(marker),
+		VMPostDelete: markerHook(marker),
 	})
 	op := new(MockOperation)
 	op.On("WaitContext", mock.Anything).Return(nil)
@@ -945,7 +957,7 @@ func TestDeleteInstanceDeleteHookFailureNonBlocking(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
 	l := newHookProvider(cli, config.Hooks{
-		VMPreDelete: &config.Hook{Command: writeExecScript(t, "exit 1")},
+		VMPreDelete: &config.Hook{Command: "exit 1"},
 	})
 	op := new(MockOperation)
 	op.On("WaitContext", mock.Anything).Return(nil)
@@ -975,7 +987,7 @@ func TestRemoveAllInstancesRunsDeleteHooks(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
 	marker := filepath.Join(t.TempDir(), "del")
-	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(t, marker)})
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(marker)})
 	cli.On("GetInstancesFull", api.InstanceTypeAny).Return([]api.InstanceFull{
 		{
 			Instance: api.Instance{

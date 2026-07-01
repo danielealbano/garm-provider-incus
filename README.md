@@ -146,8 +146,7 @@ configured in the provider config file, one optional block per hook:
 
 ```toml
 [hooks.vm_pre_create]
-    command = "/opt/garm/hooks/vm-pre-create.sh"
-    args = ["--role", "builder"]
+    command = "/opt/garm/hooks/vm-pre-create.sh --role builder"
     timeout = 60
     ignore_failure = false
 
@@ -174,10 +173,10 @@ The six hooks fire at:
 | `vm_pre_delete` | before the instance is stopped/removed |
 | `vm_post_delete` | after the instance is removed |
 
-Per-hook options: `command` (path to an executable — a shell script needs a
-shebang and the `+x` bit; it is run directly, **not** via a shell), `args`
-(passed verbatim), `timeout` (seconds; default and maximum `60`),
-`ignore_failure` (default `false`).
+Per-hook options: `command` (a shell command line run via `/bin/sh -c`),
+`timeout` (seconds; default and maximum `60`), `ignore_failure` (default
+`false`; only affects create/start hooks — delete-hook failures never block
+deletion).
 
 Every hook receives context via environment: `GARM_HOOK`, `GARM_HOOK_PHASE`,
 `GARM_INSTANCE_NAME`, `GARM_POOL_ID`, `GARM_CONTROLLER_ID`, `GARM_OS_TYPE`,
@@ -185,11 +184,9 @@ Every hook receives context via environment: `GARM_HOOK`, `GARM_HOOK_PHASE`,
 
 `vm_pre_create` receives the incus `InstancesPost` JSON on **stdin** and must
 echo the (possibly modified) `InstancesPost` JSON on **stdout**; the provider
-applies it. It MUST NOT change instance-identity fields (`name` and the
-`user.runner-controller-id` / `user.runner-pool-id` / `user.os-type` /
-`user.os-arch` config keys) — those are used by garm and by later hooks. All
-other hooks receive an instance-context JSON on stdin and their stdout is
-ignored.
+applies it. It must not change the instance `name` (garm tracks the instance by
+it). All other hooks receive an instance-context JSON on stdin and their stdout
+is ignored.
 
 Failure handling: if a create/start hook fails and `ignore_failure` is false,
 the instance is destroyed and the create returns an error; with `ignore_failure`
@@ -200,5 +197,6 @@ instance (garm retries failed creates), so they MUST be idempotent.
 
 Security: `vm_pre_create` stdin includes the full `InstancesPost`, which contains
 `user.user-data` (the runner registration token and other bootstrap secrets);
-and every hook inherits the provider process environment. Only configure trusted
-hook executables. See [`examples/hooks`](examples/hooks) for sample scripts.
+and every hook inherits the provider process environment (including `PATH`).
+Only configure trusted hook commands. See [`examples/hooks`](examples/hooks) for
+sample scripts.

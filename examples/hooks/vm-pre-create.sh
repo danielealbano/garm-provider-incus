@@ -2,7 +2,7 @@
 # vm-pre-create: mutate the incus InstancesPost before the instance is created.
 #   stdin  = api.InstancesPost JSON
 #   stdout = modified api.InstancesPost JSON (must stay a complete, valid object)
-# Do NOT change identity fields (name / user.runner-* / user.os-* config keys).
+# Do NOT change the instance name (garm tracks the instance by it).
 set -euo pipefail
 
 input="$(cat)"

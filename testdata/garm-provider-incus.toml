@@ -48,16 +48,14 @@ tls_server_certificate = ""
     public = true
     protocol = "simplestreams"
     skip_verify = false
-# Optional lifecycle hooks. Each block runs an external executable at that
-# lifecycle point. See the "Lifecycle hooks" section of the README for the
-# stdin/stdout contract, environment variables and failure semantics.
-#   command        : path to an executable (run directly, not via a shell)
-#   args           : arguments passed verbatim
+# Optional lifecycle hooks. Each block runs a command at that lifecycle point.
+# See the "Lifecycle hooks" section of the README for the stdin/stdout contract,
+# environment variables and failure semantics.
+#   command        : a shell command line run via /bin/sh -c
 #   timeout        : max seconds (default and cap: 60)
 #   ignore_failure : true = log and continue; false = abort (default)
 # [hooks.vm_pre_create]
-#     command = "/opt/garm/hooks/vm-pre-create.sh"
-#     args = ["--role", "builder"]
+#     command = "/opt/garm/hooks/vm-pre-create.sh --role builder"
 #     timeout = 60
 #     ignore_failure = false
 # [hooks.vm_post_create]

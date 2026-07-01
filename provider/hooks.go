@@ -64,7 +64,7 @@ func runHook(ctx context.Context, hook *config.Hook, hookName string, phase hook
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, hook.Command, hook.Args...)
+	cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", hook.Command)
 	cmd.Env = append(os.Environ(),
 		"GARM_HOOK="+hookName,
 		"GARM_HOOK_PHASE="+string(phase),

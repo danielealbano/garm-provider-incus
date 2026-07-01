@@ -17,22 +17,12 @@ package provider
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/cloudbase/garm-provider-incus/config"
 	"github.com/stretchr/testify/require"
 )
-
-// writeExecScript writes body to an executable /bin/sh script and returns its path.
-func writeExecScript(t *testing.T, body string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "hook.sh")
-	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o755))
-	return path
-}
 
 func TestEffectiveHookTimeout(t *testing.T) {
 	cases := map[int]time.Duration{
@@ -48,15 +38,14 @@ func TestEffectiveHookTimeout(t *testing.T) {
 }
 
 func TestRunHookStdinStdout(t *testing.T) {
-	hook := &config.Hook{Command: writeExecScript(t, "cat")}
-	out, err := runHook(context.Background(), hook, "vm_pre_create", hookPhaseCreate, hookContext{}, []byte("payload"))
+	out, err := runHook(context.Background(), &config.Hook{Command: "cat"}, "vm_pre_create", hookPhaseCreate, hookContext{}, []byte("payload"))
 	require.NoError(t, err)
 	require.Equal(t, "payload", string(out))
 }
 
 func TestRunHookEnv(t *testing.T) {
-	hook := &config.Hook{Command: writeExecScript(t,
-		`printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$GARM_HOOK" "$GARM_HOOK_PHASE" "$GARM_INSTANCE_NAME" "$GARM_POOL_ID" "$GARM_CONTROLLER_ID" "$GARM_OS_TYPE" "$GARM_OS_ARCH" "$GARM_INSTANCE_TYPE" "$GARM_HOOK_IGNORE_FAILURE"`),
+	hook := &config.Hook{
+		Command:       `printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$GARM_HOOK" "$GARM_HOOK_PHASE" "$GARM_INSTANCE_NAME" "$GARM_POOL_ID" "$GARM_CONTROLLER_ID" "$GARM_OS_TYPE" "$GARM_OS_ARCH" "$GARM_INSTANCE_TYPE" "$GARM_HOOK_IGNORE_FAILURE"`,
 		IgnoreFailure: true,
 	}
 	hc := hookContext{Name: "inst", ControllerID: "ctrl", PoolID: "pool", OSType: "linux", OSArch: "amd64", InstanceType: "virtual-machine"}
@@ -66,15 +55,13 @@ func TestRunHookEnv(t *testing.T) {
 }
 
 func TestRunHookNonZeroExit(t *testing.T) {
-	hook := &config.Hook{Command: writeExecScript(t, "echo boom >&2; exit 1")}
-	_, err := runHook(context.Background(), hook, "vm_pre_start", hookPhaseStart, hookContext{}, nil)
+	_, err := runHook(context.Background(), &config.Hook{Command: "echo boom >&2; exit 1"}, "vm_pre_start", hookPhaseStart, hookContext{}, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "boom")
 }
 
 func TestRunHookTimeout(t *testing.T) {
-	hook := &config.Hook{Command: writeExecScript(t, "sleep 3"), Timeout: 1}
-	_, err := runHook(context.Background(), hook, "vm_post_start", hookPhaseStart, hookContext{}, nil)
+	_, err := runHook(context.Background(), &config.Hook{Command: "sleep 3", Timeout: 1}, "vm_post_start", hookPhaseStart, hookContext{}, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "timed out")
 }
@@ -90,13 +77,11 @@ func TestRunHookNilOrEmpty(t *testing.T) {
 }
 
 func TestRunSideEffectHookIgnoreFailure(t *testing.T) {
-	fail := writeExecScript(t, "exit 1")
-
 	require.NoError(t, runSideEffectHook(context.Background(),
-		&config.Hook{Command: fail, IgnoreFailure: true}, "vm_pre_delete", hookPhaseDelete, hookContext{}))
+		&config.Hook{Command: "exit 1", IgnoreFailure: true}, "vm_pre_delete", hookPhaseDelete, hookContext{}))
 
 	require.Error(t, runSideEffectHook(context.Background(),
-		&config.Hook{Command: fail, IgnoreFailure: false}, "vm_post_create", hookPhaseCreate, hookContext{}))
+		&config.Hook{Command: "exit 1", IgnoreFailure: false}, "vm_post_create", hookPhaseCreate, hookContext{}))
 
 	require.NoError(t, runSideEffectHook(context.Background(), nil, "vm_post_create", hookPhaseCreate, hookContext{}))
 }
