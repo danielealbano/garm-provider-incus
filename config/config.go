@@ -88,18 +88,18 @@ const DefaultHookTimeout = 60
 // Command is a shell command line run via "/bin/sh -c".
 type Hook struct {
 	Command       string `toml:"command" json:"command"`
-	Timeout       int    `toml:"timeout" json:"timeout"`
-	IgnoreFailure bool   `toml:"ignore_failure" json:"ignore_failure"`
+	Timeout       int    `toml:"timeout" json:"timeout,omitempty"`
+	IgnoreFailure bool   `toml:"ignore_failure" json:"ignore_failure,omitempty"`
 }
 
 // Hooks groups the supported instance lifecycle hooks.
 type Hooks struct {
-	VMPreCreate  *Hook `toml:"vm_pre_create" json:"vm_pre_create"`
-	VMPostCreate *Hook `toml:"vm_post_create" json:"vm_post_create"`
-	VMPreStart   *Hook `toml:"vm_pre_start" json:"vm_pre_start"`
-	VMPostStart  *Hook `toml:"vm_post_start" json:"vm_post_start"`
-	VMPreDelete  *Hook `toml:"vm_pre_delete" json:"vm_pre_delete"`
-	VMPostDelete *Hook `toml:"vm_post_delete" json:"vm_post_delete"`
+	VMPreCreate  *Hook `toml:"vm_pre_create" json:"vm_pre_create,omitempty"`
+	VMPostCreate *Hook `toml:"vm_post_create" json:"vm_post_create,omitempty"`
+	VMPreStart   *Hook `toml:"vm_pre_start" json:"vm_pre_start,omitempty"`
+	VMPostStart  *Hook `toml:"vm_post_start" json:"vm_post_start,omitempty"`
+	VMPreDelete  *Hook `toml:"vm_pre_delete" json:"vm_pre_delete,omitempty"`
+	VMPostDelete *Hook `toml:"vm_post_delete" json:"vm_post_delete,omitempty"`
 }
 
 // Validate checks the hook has a command and normalizes the timeout to the
@@ -119,6 +119,9 @@ func (h *Hook) Validate() error {
 
 // Validate validates every configured hook.
 func (h *Hooks) Validate() error {
+	if h == nil {
+		return nil
+	}
 	for _, hook := range []*Hook{
 		h.VMPreCreate, h.VMPostCreate, h.VMPreStart,
 		h.VMPostStart, h.VMPreDelete, h.VMPostDelete,

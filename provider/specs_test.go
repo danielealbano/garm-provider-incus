@@ -21,6 +21,7 @@ import (
 
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	"github.com/cloudbase/garm-provider-common/params"
+	"github.com/cloudbase/garm-provider-incus/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -157,6 +158,36 @@ var testCases = []struct {
 		input:          json.RawMessage(`{"additional_property": true}`),
 		expectedOutput: extraSpecs{},
 		errString:      "Additional property additional_property is not allowed",
+	},
+	{
+		name:           "specs just with hooks",
+		input:          json.RawMessage(`{"hooks": {"vm_pre_create": {"command": "/opt/x.sh", "timeout": 30}}}`),
+		expectedOutput: extraSpecs{Hooks: &config.Hooks{VMPreCreate: &config.Hook{Command: "/opt/x.sh", Timeout: 30}}},
+		errString:      "",
+	},
+	{
+		name:           "empty hooks disables config",
+		input:          json.RawMessage(`{"hooks": {}}`),
+		expectedOutput: extraSpecs{Hooks: &config.Hooks{}},
+		errString:      "",
+	},
+	{
+		name:           "hook missing command",
+		input:          json.RawMessage(`{"hooks": {"vm_pre_create": {"timeout": 30}}}`),
+		expectedOutput: extraSpecs{},
+		errString:      "command is required",
+	},
+	{
+		name:           "hook with unknown property",
+		input:          json.RawMessage(`{"hooks": {"vm_pre_create": {"command": "/x", "bogus": 1}}}`),
+		expectedOutput: extraSpecs{},
+		errString:      "Additional property bogus is not allowed",
+	},
+	{
+		name:           "hook with empty command fails validation",
+		input:          json.RawMessage(`{"hooks": {"vm_pre_create": {"command": ""}}}`),
+		expectedOutput: extraSpecs{Hooks: &config.Hooks{VMPreCreate: &config.Hook{Command: ""}}},
+		errString:      "validating hooks",
 	},
 }
 

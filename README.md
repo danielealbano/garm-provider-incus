@@ -188,12 +188,41 @@ applies it. It must not change the instance `name` (garm tracks the instance by
 it). All other hooks receive an instance-context JSON on stdin and their stdout
 is ignored.
 
+Hooks can also be set per pool through `extra_specs`, which **replaces** the
+provider config hooks for that pool:
+
+- no `hooks` key → the provider config hooks apply;
+- `hooks` set → only those hooks run (config hooks are ignored, so re-declare
+  any you still want);
+- `hooks: {}` → no hooks for that pool.
+
+The `hooks` object takes the same per-hook fields as the config file:
+
+```json
+{
+    "hooks": {
+        "vm_pre_create": {
+            "command": "/opt/garm/hooks/vm-pre-create.sh --role builder",
+            "timeout": 60
+        },
+        "vm_pre_delete": {
+            "command": "/opt/garm/hooks/vm-pre-delete.sh",
+            "ignore_failure": true
+        }
+    }
+}
+```
+
+```bash
+garm-cli pool update <POOL_ID> --extra-specs='{"hooks":{"vm_pre_create":{"command":"/opt/garm/hooks/vm-pre-create.sh"}}}'
+```
+
 Failure handling: if a create/start hook fails and `ignore_failure` is false,
 the instance is destroyed and the create returns an error; with `ignore_failure`
 true the failure is logged and creation continues. Delete-hook failures never
 block deletion (they are logged). Delete hooks also fire during
-`RemoveAllInstances` (once per instance) and may fire for an already-gone
-instance (garm retries failed creates), so they MUST be idempotent.
+`RemoveAllInstances` (once per instance) and may run more than once if a
+deletion is retried, so they MUST be idempotent.
 
 Security: `vm_pre_create` stdin includes the full `InstancesPost`, which contains
 `user.user-data` (the runner registration token and other bootstrap secrets);

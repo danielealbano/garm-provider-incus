@@ -55,6 +55,10 @@ const (
 	// architecture a runner is supposed to have. This value is defined in the pool and
 	// passed into the provider as bootstrap params.
 	osArchKeyNAme = "user.os-arch"
+
+	// deleteHooksKeyName persists the resolved delete hooks on the instance so
+	// DeleteInstance can recover them (garm does not pass extra_specs at delete).
+	deleteHooksKeyName = "user.garm-incus-delete-hooks"
 )
 
 var (
@@ -257,7 +261,7 @@ func (l *Incus) getCreateInstanceArgs(ctx context.Context, bootstrapParams commo
 	return args, nil
 }
 
-func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost, hc hookContext) error {
+func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost, hc hookContext, hooks config.Hooks) error {
 	cli, err := l.getCLI(ctx)
 	if err != nil {
 		return errors.Wrap(err, "fetching client")
@@ -274,11 +278,11 @@ func (l *Incus) launchInstance(ctx context.Context, createArgs api.InstancesPost
 		return errors.Wrap(err, "waiting for instance creation")
 	}
 
-	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPostCreate, "vm_post_create", hookPhaseCreate, hc); err != nil {
+	if err := runSideEffectHook(ctx, hooks.VMPostCreate, "vm_post_create", hookPhaseCreate, hc); err != nil {
 		l.cleanupFailedInstance(ctx, createArgs.Name)
 		return errors.Wrap(err, "vm_post_create hook")
 	}
-	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPreStart, "vm_pre_start", hookPhaseStart, hc); err != nil {
+	if err := runSideEffectHook(ctx, hooks.VMPreStart, "vm_pre_start", hookPhaseStart, hc); err != nil {
 		l.cleanupFailedInstance(ctx, createArgs.Name)
 		return errors.Wrap(err, "vm_pre_start hook")
 	}
@@ -315,17 +319,8 @@ func hookContextFromBootstrap(bootstrapParams commonParams.BootstrapInstance, co
 	}
 }
 
-// hookContextForInstance builds a best-effort context (delete time; name only).
-func (l *Incus) hookContextForInstance(ctx context.Context, name string) hookContext {
+func (l *Incus) hookContextFromFull(name string, full *api.InstanceFull) hookContext {
 	hc := hookContext{Name: name, ControllerID: l.controllerID, InstanceType: string(l.cfg.GetInstanceType())}
-	cli, err := l.getCLI(ctx)
-	if err != nil {
-		return hc
-	}
-	full, _, err := cli.GetInstanceFull(name)
-	if err != nil {
-		return hc
-	}
 	hc.PoolID = full.ExpandedConfig[poolIDKey]
 	hc.OSArch = string(incusToConfigArch[full.Architecture])
 	incusOS := full.ExpandedConfig["image.os"]
@@ -335,6 +330,44 @@ func (l *Incus) hookContextForInstance(ctx context.Context, name string) hookCon
 	}
 	hc.OSType = string(osType)
 	return hc
+}
+
+// instanceDeleteHooks is the delete-hook subset persisted on the instance.
+type instanceDeleteHooks struct {
+	VMPreDelete  *config.Hook `json:"vm_pre_delete,omitempty"`
+	VMPostDelete *config.Hook `json:"vm_post_delete,omitempty"`
+}
+
+// resolveDeleteHooks returns an instance's delete hooks: the per-instance set
+// persisted from extra_specs if present, otherwise the config hooks. ok is
+// false only when the instance is gone (not found), in which case no hooks run.
+func (l *Incus) resolveDeleteHooks(ctx context.Context, name string) (pre, post *config.Hook, hc hookContext, ok bool) {
+	hc = hookContext{Name: name, ControllerID: l.controllerID, InstanceType: string(l.cfg.GetInstanceType())}
+	cli, err := l.getCLI(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fetching client for delete hooks of %s; using config hooks: %v\n", name, err)
+		return l.cfg.Hooks.VMPreDelete, l.cfg.Hooks.VMPostDelete, hc, true
+	}
+	full, _, err := cli.GetInstanceFull(name)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, nil, hc, false
+		}
+		fmt.Fprintf(os.Stderr, "reading instance %s for delete hooks; using config hooks: %v\n", name, err)
+		return l.cfg.Hooks.VMPreDelete, l.cfg.Hooks.VMPostDelete, hc, true
+	}
+	hc = l.hookContextFromFull(name, full)
+	if raw, present := full.ExpandedConfig[deleteHooksKeyName]; present {
+		var dh instanceDeleteHooks
+		if err := json.Unmarshal([]byte(raw), &dh); err != nil {
+			// The key's presence means extra_specs replaced config; a corrupt
+			// value is unrecoverable, so skip rather than leak config hooks.
+			fmt.Fprintf(os.Stderr, "parsing persisted delete hooks for %s; skipping delete hooks: %v\n", name, err)
+			return nil, nil, hc, true
+		}
+		return dh.VMPreDelete, dh.VMPostDelete, hc, true
+	}
+	return l.cfg.Hooks.VMPreDelete, l.cfg.Hooks.VMPostDelete, hc, true
 }
 
 // cleanupFailedInstance removes an instance without running delete hooks.
@@ -357,7 +390,12 @@ func (l *Incus) CreateInstance(ctx context.Context, bootstrapParams commonParams
 
 	hc := hookContextFromBootstrap(bootstrapParams, l.controllerID, l.cfg.GetInstanceType())
 
-	if hook := l.cfg.Hooks.VMPreCreate; hook != nil {
+	hooks := l.cfg.Hooks
+	if extraSpecs.Hooks != nil {
+		hooks = *extraSpecs.Hooks
+	}
+
+	if hook := hooks.VMPreCreate; hook != nil {
 		payload, err := json.Marshal(args)
 		if err != nil {
 			return commonParams.ProviderInstance{}, errors.Wrap(err, "marshaling create args for vm_pre_create hook")
@@ -380,7 +418,18 @@ func (l *Incus) CreateInstance(ctx context.Context, bootstrapParams commonParams
 		}
 	}
 
-	if err := l.launchInstance(ctx, args, hc); err != nil {
+	if extraSpecs.Hooks != nil {
+		payload, err := json.Marshal(instanceDeleteHooks{hooks.VMPreDelete, hooks.VMPostDelete})
+		if err != nil {
+			return commonParams.ProviderInstance{}, errors.Wrap(err, "marshaling delete hooks")
+		}
+		if args.Config == nil {
+			args.Config = map[string]string{}
+		}
+		args.Config[deleteHooksKeyName] = string(payload)
+	}
+
+	if err := l.launchInstance(ctx, args, hc, hooks); err != nil {
 		return commonParams.ProviderInstance{}, errors.Wrap(err, "creating instance")
 	}
 
@@ -391,7 +440,7 @@ func (l *Incus) CreateInstance(ctx context.Context, bootstrapParams commonParams
 	}
 
 	// vm_post_start: instance has an IPv4, i.e. the incus-agent is reachable.
-	if err := runSideEffectHook(ctx, l.cfg.Hooks.VMPostStart, "vm_post_start", hookPhaseStart, hc); err != nil {
+	if err := runSideEffectHook(ctx, hooks.VMPostStart, "vm_post_start", hookPhaseStart, hc); err != nil {
 		l.cleanupFailedInstance(ctx, args.Name)
 		return commonParams.ProviderInstance{}, errors.Wrap(err, "vm_post_start hook")
 	}
@@ -416,23 +465,21 @@ func (l *Incus) GetInstance(ctx context.Context, instanceName string) (commonPar
 	return incusInstanceToAPIInstance(instance), nil
 }
 
-// DeleteInstance deletes the instance, running vm_pre_delete/vm_post_delete
-// around it. With no delete hook it is identical to deleteInstanceRaw.
+// DeleteInstance deletes the instance, running its resolved
+// vm_pre_delete/vm_post_delete hooks around the removal.
 func (l *Incus) DeleteInstance(ctx context.Context, instance string) error {
-	hooks := l.cfg.Hooks
-	if hooks.VMPreDelete == nil && hooks.VMPostDelete == nil {
+	pre, post, hc, ok := l.resolveDeleteHooks(ctx, instance)
+	if !ok || (pre == nil && post == nil) {
 		return l.deleteInstanceRaw(ctx, instance)
 	}
 
-	hc := l.hookContextForInstance(ctx, instance)
-
-	if err := runSideEffectHook(ctx, hooks.VMPreDelete, "vm_pre_delete", hookPhaseDelete, hc); err != nil {
+	if err := runSideEffectHook(ctx, pre, "vm_pre_delete", hookPhaseDelete, hc); err != nil {
 		fmt.Fprintf(os.Stderr, "vm_pre_delete hook failed for %s; continuing: %v\n", instance, err)
 	}
 	if err := l.deleteInstanceRaw(ctx, instance); err != nil {
 		return err
 	}
-	if err := runSideEffectHook(ctx, hooks.VMPostDelete, "vm_post_delete", hookPhaseDelete, hc); err != nil {
+	if err := runSideEffectHook(ctx, post, "vm_post_delete", hookPhaseDelete, hc); err != nil {
 		fmt.Fprintf(os.Stderr, "vm_post_delete hook failed for %s: %v\n", instance, err)
 	}
 	return nil

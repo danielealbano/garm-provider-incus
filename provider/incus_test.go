@@ -381,7 +381,7 @@ func TestLaunchInstance(t *testing.T) {
 		Timeout: -1,
 	}, "").Return(mockOp, nil)
 
-	err := l.launchInstance(ctx, createArgs, hookContext{})
+	err := l.launchInstance(ctx, createArgs, hookContext{}, config.Hooks{})
 	require.NoError(t, err)
 }
 
@@ -582,6 +582,7 @@ func TestDeleteInstance(t *testing.T) {
 	}
 	mockOp := new(MockOperation)
 	mockOp.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("GetInstanceFull", "test-instance").Return(&api.InstanceFull{}, "", nil)
 	cli.On("DeleteInstance", "test-instance").Return(mockOp, nil)
 	cli.On("UpdateInstanceState", "test-instance", api.InstanceStatePut{
 		Action:  "stop",
@@ -723,6 +724,7 @@ func TestRemoveAllInstances(t *testing.T) {
 	}, nil)
 	mockOp := new(MockOperation)
 	mockOp.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("GetInstanceFull", instanceName).Return(&api.InstanceFull{}, "", nil)
 	cli.On("DeleteInstance", instanceName).Return(mockOp, nil)
 	cli.On("UpdateInstanceState", "test-instance", api.InstanceStatePut{
 		Action:  "stop",
@@ -969,17 +971,17 @@ func TestDeleteInstanceDeleteHookFailureNonBlocking(t *testing.T) {
 	cli.AssertCalled(t, "DeleteInstance", "test-instance")
 }
 
-func TestDeleteInstanceNoHooksRawPath(t *testing.T) {
+func TestDeleteInstanceNoHooks(t *testing.T) {
 	ctx := context.Background()
 	cli := new(MockIncusServer)
 	l := newHookProvider(cli, config.Hooks{})
 	op := new(MockOperation)
 	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("GetInstanceFull", "test-instance").Return(&api.InstanceFull{}, "", nil)
 	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
 	cli.On("DeleteInstance", "test-instance").Return(op, nil)
 
 	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
-	cli.AssertNotCalled(t, "GetInstanceFull", "test-instance")
 	cli.AssertCalled(t, "DeleteInstance", "test-instance")
 }
 
@@ -1006,6 +1008,163 @@ func TestRemoveAllInstancesRunsDeleteHooks(t *testing.T) {
 	cli.On("DeleteInstance", "test-instance").Return(op, nil)
 
 	require.NoError(t, l.RemoveAllInstances(ctx))
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "vm_pre_delete ", string(got))
+}
+
+func hookBootstrapWithSpecs(specs string) commonParams.BootstrapInstance {
+	bp := hookBootstrap()
+	bp.ExtraSpecs = []byte(specs)
+	return bp
+}
+
+func TestCreateInstanceExtraSpecsOverridesConfigHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	dir := t.TempDir()
+	cfgMarker := filepath.Join(dir, "cfg")
+	esMarker := filepath.Join(dir, "es")
+	l := newHookProvider(cli, config.Hooks{
+		VMPreCreate: &config.Hook{Command: fmt.Sprintf("printf config > %q", cfgMarker)},
+	})
+	op := setupCreateFlow(cli)
+	cli.On("CreateInstance", mock.Anything).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	specs := fmt.Sprintf(`{"hooks":{"vm_pre_create":{"command":%q}}}`, fmt.Sprintf("printf extra > %q", esMarker))
+	_, err := l.CreateInstance(ctx, hookBootstrapWithSpecs(specs))
+	require.NoError(t, err)
+
+	got, err := os.ReadFile(esMarker)
+	require.NoError(t, err)
+	require.Equal(t, "extra", string(got))
+	require.NoFileExists(t, cfgMarker)
+}
+
+func TestCreateInstanceExtraSpecsEmptyDisablesConfigHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	cfgMarker := filepath.Join(t.TempDir(), "cfg")
+	l := newHookProvider(cli, config.Hooks{
+		VMPreCreate: &config.Hook{Command: fmt.Sprintf("printf config > %q", cfgMarker)},
+	})
+	op := setupCreateFlow(cli)
+	cli.On("CreateInstance", mock.Anything).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrapWithSpecs(`{"hooks":{}}`))
+	require.NoError(t, err)
+	require.NoFileExists(t, cfgMarker)
+}
+
+func TestCreateInstancePersistsDeleteHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	l := newHookProvider(cli, config.Hooks{})
+	op := setupCreateFlow(cli)
+	var got api.InstancesPost
+	cli.On("CreateInstance", mock.Anything).Run(func(a mock.Arguments) { got = a.Get(0).(api.InstancesPost) }).Return(op, nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	mockInstanceWithIP(cli)
+
+	_, err := l.CreateInstance(ctx, hookBootstrapWithSpecs(`{"hooks":{"vm_pre_delete":{"command":"true"}}}`))
+	require.NoError(t, err)
+	require.Contains(t, got.Config[deleteHooksKeyName], `"vm_pre_delete"`)
+	require.Contains(t, got.Config[deleteHooksKeyName], `"command":"true"`)
+}
+
+func TestDeleteInstanceUsesPersistedHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	// config defines a failing delete hook; the persisted one must win.
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: &config.Hook{Command: "exit 1"}})
+	persisted := fmt.Sprintf(`{"vm_pre_delete":{"command":%q}}`, fmt.Sprintf("printf persisted > %q", marker))
+	cli.On("GetInstanceFull", "test-instance").Return(&api.InstanceFull{
+		Instance: api.Instance{
+			Name:           "test-instance",
+			ExpandedConfig: map[string]string{deleteHooksKeyName: persisted},
+		},
+	}, "", nil)
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "persisted", string(got))
+}
+
+func TestDeleteInstanceCorruptPersistedHooksSkips(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	// A corrupt persisted value is replace-mode, so config hooks must NOT leak.
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(marker)})
+	cli.On("GetInstanceFull", "test-instance").Return(&api.InstanceFull{
+		Instance: api.Instance{
+			Name:           "test-instance",
+			ExpandedConfig: map[string]string{deleteHooksKeyName: "not json{"},
+		},
+	}, "", nil)
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	require.NoFileExists(t, marker)
+}
+
+func TestDeleteInstanceNotFoundRunsNoHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(marker)})
+	cli.On("GetInstanceFull", "test-instance").Return((*api.InstanceFull)(nil), "", os.ErrNotExist)
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
+	require.NoFileExists(t, marker)
+}
+
+func TestDeleteInstanceClientErrorUsesConfigHooks(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "del")
+	// cli is nil and the config has no endpoint, so getCLI fails; config hooks
+	// must still run best-effort (the raw delete then errors).
+	l := &Incus{
+		cfg:          &config.Incus{Hooks: config.Hooks{VMPreDelete: markerHook(marker)}},
+		imageManager: &image{},
+		controllerID: "controller",
+	}
+	require.Error(t, l.DeleteInstance(ctx, "test-instance"))
+	got, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, "vm_pre_delete ", string(got))
+}
+
+func TestDeleteInstanceReadErrorUsesConfigHooks(t *testing.T) {
+	ctx := context.Background()
+	cli := new(MockIncusServer)
+	marker := filepath.Join(t.TempDir(), "del")
+	l := newHookProvider(cli, config.Hooks{VMPreDelete: markerHook(marker)})
+	// A non-not-found read error must not silently skip the delete hooks.
+	cli.On("GetInstanceFull", "test-instance").Return((*api.InstanceFull)(nil), "", fmt.Errorf("boom"))
+	op := new(MockOperation)
+	op.On("WaitContext", mock.Anything).Return(nil)
+	cli.On("UpdateInstanceState", "test-instance", mock.Anything, "").Return(op, nil)
+	cli.On("DeleteInstance", "test-instance").Return(op, nil)
+
+	require.NoError(t, l.DeleteInstance(ctx, "test-instance"))
 	got, err := os.ReadFile(marker)
 	require.NoError(t, err)
 	require.Equal(t, "vm_pre_delete ", string(got))

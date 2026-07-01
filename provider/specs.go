@@ -21,14 +21,16 @@ import (
 
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
+	"github.com/cloudbase/garm-provider-incus/config"
 	"github.com/pkg/errors"
 	"github.com/xeipuuv/gojsonschema"
 )
 
 type extraSpecs struct {
-	ExtraPackages   []string `json:"extra_packages,omitempty" jsonschema:"description=A list of packages that cloud-init should install on the instance."`
-	DisableUpdates  bool     `json:"disable_updates,omitempty" jsonschema:"description=Whether to disable updates when cloud-init comes online."`
-	EnableBootDebug bool     `json:"enable_boot_debug,omitempty" jsonschema:"description=Allows providers to set the -x flag in the runner install script."`
+	ExtraPackages   []string      `json:"extra_packages,omitempty" jsonschema:"description=A list of packages that cloud-init should install on the instance."`
+	DisableUpdates  bool          `json:"disable_updates,omitempty" jsonschema:"description=Whether to disable updates when cloud-init comes online."`
+	EnableBootDebug bool          `json:"enable_boot_debug,omitempty" jsonschema:"description=Allows providers to set the -x flag in the runner install script."`
+	Hooks           *config.Hooks `json:"hooks,omitempty" jsonschema:"description=Lifecycle hooks for this pool. When set, it fully replaces the provider config hooks."`
 	cloudconfig.CloudConfigSpec
 }
 
@@ -58,6 +60,9 @@ func parseExtraSpecsFromBootstrapParams(bootstrapParams commonParams.BootstrapIn
 
 	if err := json.Unmarshal(bootstrapParams.ExtraSpecs, &specs); err != nil {
 		return specs, errors.Wrap(err, "unmarshaling extra specs")
+	}
+	if err := specs.Hooks.Validate(); err != nil {
+		return specs, errors.Wrap(err, "validating hooks")
 	}
 	return specs, nil
 }
